@@ -33,7 +33,12 @@
     {
       "question": "How do we hash an instance of a class in Python?",
       "type": "multiple_choice",
-      "options": ["Define Hash in a class", "Call hash() on an instance", "Cast class into a string", "I don't know, I'm lost"],
+      "options": [
+        "Define Hash in a class",
+        "Call hash() on an instance",
+        "Cast class into a string",
+        "I don't know, I'm lost"
+      ],
       "answer": "Call hash() on an instance",
       "category": "Classes",
       "hint": "The built-in hash function works on hashable objects"
@@ -63,7 +68,12 @@
     {
       "question": "What does dict.keys() return?",
       "type": "multiple_choice",
-      "options": ["A list of values", "A view of keys", "A tuple of pairs", "The number of keys"],
+      "options": [
+        "A list of values",
+        "A view of keys",
+        "A tuple of pairs",
+        "The number of keys"
+      ],
       "answer": "A view of keys",
       "category": "Data Structures",
       "hint": "It does not return values"

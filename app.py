@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 import os
 import random
@@ -12,6 +13,7 @@ USER_DB = Path("user.db")
 QUESTION_BANK_FILE = Path("question_bank.json")
 GENERATED_QUIZ_FILE = Path("generated_quiz.json")
 SCORE_HISTORY_FILE = Path("score_history.bin")
+SCORE_HISTORY_KEY_FILE = Path("score_history.key")
 
 PBKDF2_ROUNDS = 200_000
 HISTORY_MAGIC = b"QH1"
@@ -67,8 +69,13 @@ def load_question_bank() -> List[Dict]:
     if not QUESTION_BANK_FILE.exists():
         raise QuizError("Question bank file is missing.")
 
-    with QUESTION_BANK_FILE.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
+    try:
+        with QUESTION_BANK_FILE.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise QuizError("Question bank JSON is malformed.") from exc
+    except OSError as exc:
+        raise QuizError("Question bank file could not be read.") from exc
 
     questions = payload.get("questions")
     if not isinstance(questions, list) or not questions:
@@ -117,6 +124,7 @@ def load_question_bank() -> List[Dict]:
 
 def create_quiz_db(question_bank: List[Dict]) -> None:
     with sqlite3.connect(QUIZ_DB) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS questions (
@@ -137,10 +145,44 @@ def create_quiz_db(question_bank: List[Dict]) -> None:
                 question_id INTEGER NOT NULL,
                 liked INTEGER NOT NULL,
                 updated_at TEXT NOT NULL,
-                PRIMARY KEY (user_id, question_id)
+                PRIMARY KEY (user_id, question_id),
+                FOREIGN KEY (question_id) REFERENCES questions(id) ON DELETE CASCADE,
+                CHECK (liked IN (-1, 1))
             )
             """
         )
+
+        schema_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'question_feedback'"
+        ).fetchone()
+        schema_sql = schema_row[0] if schema_row else ""
+        if "FOREIGN KEY (question_id)" not in schema_sql or "CHECK (liked IN (-1, 1))" not in schema_sql:
+            conn.execute("ALTER TABLE question_feedback RENAME TO question_feedback_old")
+            conn.execute(
+                """
+                CREATE TABLE question_feedback (
+                    user_id INTEGER NOT NULL,
+                    question_id INTEGER NOT NULL,
+                    liked INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, question_id),
+                    FOREIGN KEY (question_id) REFERENCES questions(id) ON DELETE CASCADE,
+                    CHECK (liked IN (-1, 1))
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO question_feedback (user_id, question_id, liked, updated_at)
+                SELECT qf.user_id, qf.question_id,
+                       CASE WHEN qf.liked > 0 THEN 1 ELSE -1 END,
+                       qf.updated_at
+                FROM question_feedback_old qf
+                JOIN questions q ON q.id = qf.question_id
+                WHERE qf.liked <> 0
+                """
+            )
+            conn.execute("DROP TABLE question_feedback_old")
 
         for q in question_bank:
             conn.execute(
@@ -167,8 +209,25 @@ def create_quiz_db(question_bank: List[Dict]) -> None:
 
 
 def _history_key() -> bytes:
-    secret = os.getenv("QUIZ_HISTORY_KEY", "quiz-history-default-key")
-    return hashlib.sha256(secret.encode("utf-8")).digest()
+    secret = os.getenv("QUIZ_HISTORY_KEY")
+    if secret:
+        return hashlib.sha256(secret.encode("utf-8")).digest()
+
+    if SCORE_HISTORY_KEY_FILE.exists():
+        key = SCORE_HISTORY_KEY_FILE.read_bytes()
+        if len(key) == 32:
+            return key
+
+    key = os.urandom(32)
+    with SCORE_HISTORY_KEY_FILE.open("wb") as f:
+        f.write(key)
+
+    try:
+        os.chmod(SCORE_HISTORY_KEY_FILE, 0o600)
+    except OSError:
+        pass
+
+    return key
 
 
 def _xor_stream(data: bytes, nonce: bytes, key: bytes) -> bytes:
@@ -186,6 +245,7 @@ def append_score_history(username: str, score_payload: Dict) -> None:
     nonce = os.urandom(16)
     raw = json.dumps(score_payload, separators=(",", ":")).encode("utf-8")
     encrypted = _xor_stream(raw, nonce, key)
+    tag = hmac.new(key, nonce + encrypted, hashlib.sha256).digest()
 
     username_bytes = username.encode("utf-8")
     record = (
@@ -195,6 +255,7 @@ def append_score_history(username: str, score_payload: Dict) -> None:
         + nonce
         + len(encrypted).to_bytes(4, "big")
         + encrypted
+        + tag
     )
 
     with SCORE_HISTORY_FILE.open("ab") as f:
@@ -238,12 +299,37 @@ def read_user_score_history(username: str) -> List[Dict]:
         encrypted = data[cursor : cursor + payload_len]
         cursor += payload_len
 
+        # Backward compatibility: support both legacy records (no HMAC tag)
+        # and newer authenticated records (32-byte HMAC tag).
+        has_tag = False
+        tag = b""
+        if cursor + 32 <= len(data):
+            candidate_tag = data[cursor : cursor + 32]
+            expected_tag = hmac.new(key, nonce + encrypted, hashlib.sha256).digest()
+            if hmac.compare_digest(candidate_tag, expected_tag):
+                has_tag = True
+                tag = candidate_tag
+                cursor += 32
+            elif cursor + 32 == len(data) or data[cursor + 32 : cursor + 35] == HISTORY_MAGIC:
+                # Looks like a tagged record but tag/key mismatch; consume tag
+                # so parsing can continue with later records.
+                has_tag = True
+                tag = candidate_tag
+                cursor += 32
+
         if user != username:
             continue
 
         try:
+            if has_tag:
+                expected_tag = hmac.new(key, nonce + encrypted, hashlib.sha256).digest()
+                if not hmac.compare_digest(tag, expected_tag):
+                    continue
+
             decrypted = _xor_stream(encrypted, nonce, key)
             payload = json.loads(decrypted.decode("utf-8"))
+            if not isinstance(payload, dict):
+                continue
             records.append(payload)
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
@@ -281,7 +367,7 @@ def verify_login(username: str, password: str) -> Optional[int]:
 
         user_id, salt, stored_hash = row
         computed_hash = hash_password(password, salt)
-        if computed_hash != stored_hash:
+        if not hmac.compare_digest(computed_hash, stored_hash):
             return None
 
         conn.execute(
@@ -389,6 +475,23 @@ def get_all_questions_with_feedback(user_id: int) -> List[Dict]:
     return questions
 
 
+def get_total_question_count() -> int:
+    with sqlite3.connect(QUIZ_DB) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM questions").fetchone()
+    return int(row[0]) if row else 0
+
+
+def get_answer_map(question_ids: List[int]) -> Dict[int, str]:
+    if not question_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in question_ids)
+    query = f"SELECT id, answer FROM questions WHERE id IN ({placeholders})"
+    with sqlite3.connect(QUIZ_DB) as conn:
+        rows = conn.execute(query, tuple(question_ids)).fetchall()
+    return {int(row[0]): str(row[1]) for row in rows}
+
+
 def weighted_random_sample(questions: List[Dict], count: int) -> List[Dict]:
     pool = questions[:]
     selected: List[Dict] = []
@@ -424,7 +527,6 @@ def generate_quiz_json(user_id: int, count: int) -> None:
                 "question": q["question"],
                 "type": q["type"],
                 "options": q["options"],
-                "answer": q["answer"],
                 "category": q["category"],
                 "hint": q["hint"],
             }
@@ -466,13 +568,111 @@ def prompt_yes_no(prompt_text: str) -> bool:
         print("Please answer with yes or no.")
 
 
+def prompt_logged_in_action() -> str:
+    print("\nWhat would you like to do?")
+    print("1. Take a quiz")
+    print("2. View score history")
+    print("3. View liked/disliked questions")
+    print("4. Logout")
+
+    while True:
+        choice = input("Choose an option (1/2/3/4): ").strip()
+        if choice in {"1", "2", "3", "4"}:
+            return choice
+        print("Invalid option. Please enter 1, 2, 3, or 4.")
+
+
+def show_user_history(username: str) -> None:
+    records = read_user_score_history(username)
+    if not records:
+        print("No score history found yet.")
+        return
+
+    print("\nScore history:")
+    for idx, record in enumerate(records, start=1):
+        timestamp = str(record.get("timestamp", "unknown"))
+        try:
+            score = float(record.get("score", 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
+        try:
+            total = int(record.get("total_questions", 0))
+        except (TypeError, ValueError):
+            total = 0
+        try:
+            percent = float(record.get("percent", 0.0))
+        except (TypeError, ValueError):
+            percent = 0.0
+        try:
+            hints_used = int(record.get("hints_used", 0))
+        except (TypeError, ValueError):
+            hints_used = 0
+        print(
+            f"{idx}. {timestamp} | score={score:.2f}/{total} | "
+            f"percent={percent:.2f}% | hints_used={hints_used}"
+        )
+
+    avg_percent = sum(float(r.get("percent", 0.0)) for r in records) / len(records)
+    best_percent = max(float(r.get("percent", 0.0)) for r in records)
+    print(f"Summary: attempts={len(records)}, avg={avg_percent:.2f}%, best={best_percent:.2f}%")
+
+
+def show_liked_questions(user_id: int) -> None:
+    query = """
+        SELECT q.question, q.category, f.liked
+        FROM question_feedback f
+        JOIN questions q ON q.id = f.question_id
+        WHERE f.user_id = ? AND f.liked IN (-1, 1)
+        ORDER BY f.updated_at DESC
+    """
+    with sqlite3.connect(QUIZ_DB) as conn:
+        rows = conn.execute(query, (user_id,)).fetchall()
+
+    if not rows:
+        print("No liked/disliked questions found yet.")
+        return
+
+    print("\nLiked/disliked questions:")
+    for idx, (question, category, liked) in enumerate(rows, start=1):
+        sentiment = "LIKE" if int(liked) > 0 else "DISLIKE"
+        print(f"{idx}. [{sentiment}] [{category}] {question}")
+
+
+def show_disliked_questions(user_id: int) -> None:
+    query = """
+        SELECT q.question, q.category
+        FROM question_feedback f
+        JOIN questions q ON q.id = f.question_id
+        WHERE f.user_id = ? AND f.liked = -1
+        ORDER BY f.updated_at DESC
+    """
+    with sqlite3.connect(QUIZ_DB) as conn:
+        rows = conn.execute(query, (user_id,)).fetchall()
+
+    if not rows:
+        print("\nNo disliked questions found yet.")
+        return
+
+    print("\nDisliked questions:")
+    for idx, (question, category) in enumerate(rows, start=1):
+        print(f"{idx}. [{category}] {question}")
+
+
+def prompt_return_to_interface() -> None:
+    input("\nPress Enter to return to the interface...")
+
+
 def prompt_multiple_choice(question: Dict) -> str:
     options = question.get("options", [])
     for index, option in enumerate(options, start=1):
         print(f"  {index}. {option}")
 
+    normalized_options = {normalize_text(opt): opt for opt in options if isinstance(opt, str)}
+
     while True:
-        raw = input("Answer using option number or exact text: ").strip()
+        raw = input("Answer using option number or exact text (type hint for hint): ").strip()
+        if normalize_text(raw) == "hint":
+            return "__HINT__"
         if raw.isdigit():
             selected_idx = int(raw)
             if 1 <= selected_idx <= len(options):
@@ -483,12 +683,18 @@ def prompt_multiple_choice(question: Dict) -> str:
         if raw in options:
             return raw
 
+        normalized = normalize_text(raw)
+        if normalized in normalized_options:
+            return normalized_options[normalized]
+
         print("Invalid format. Enter a valid option number or exact option text.")
 
 
 def prompt_true_false() -> str:
     while True:
-        raw = input("Answer (true/false): ").strip().lower()
+        raw = input("Answer (true/false, or type hint for hint): ").strip().lower()
+        if normalize_text(raw) == "hint":
+            return "__HINT__"
         if raw in {"true", "t"}:
             return "true"
         if raw in {"false", "f"}:
@@ -498,7 +704,9 @@ def prompt_true_false() -> str:
 
 def prompt_short_answer() -> str:
     while True:
-        raw = input("Answer (short text): ").strip()
+        raw = input("Answer (short text, or type hint for hint): ").strip()
+        if normalize_text(raw) == "hint":
+            return "__HINT__"
         if raw:
             return raw
         print("Invalid format. Please provide a non-empty short answer.")
@@ -536,6 +744,7 @@ def prompt_feedback(user_id: int, question_id: int) -> None:
 def run_quiz(user_id: int, username: str, questions: List[Dict]) -> None:
     score = 0.0
     hints_used = 0
+    answer_map = get_answer_map([int(question["id"]) for question in questions])
 
     print("\nStarting quiz...\n")
     for index, question in enumerate(questions, start=1):
@@ -543,31 +752,43 @@ def run_quiz(user_id: int, username: str, questions: List[Dict]) -> None:
         print(f"Category: {question.get('category', 'General')}")
 
         used_hint = False
-        if prompt_yes_no("Need a hint? (yes/no): "):
-            print(f"Hint: {question.get('hint', 'No hint available.')}")
-            used_hint = True
-            hints_used += 1
 
         qtype = question["type"]
+        question_id = int(question["id"])
+        correct_answer = answer_map.get(question_id, "")
+
+        while True:
+            if qtype == "multiple_choice":
+                user_answer = prompt_multiple_choice(question)
+            elif qtype == "true_false":
+                print("Choices: true, false")
+                user_answer = prompt_true_false()
+            else:
+                user_answer = prompt_short_answer()
+
+            if user_answer == "__HINT__":
+                if used_hint:
+                    print("Hint already shown for this question. Please submit your answer.")
+                else:
+                    print(f"Hint: {question.get('hint', 'No hint available.')}")
+                    used_hint = True
+                    hints_used += 1
+                continue
+            break
+
         if qtype == "multiple_choice":
-            user_answer = prompt_multiple_choice(question)
-            correct_answer = question["answer"]
-            is_correct = user_answer == correct_answer
+            is_correct = normalize_text(user_answer) == normalize_text(correct_answer)
         elif qtype == "true_false":
-            user_answer = prompt_true_false()
-            correct_answer = normalize_text(question["answer"])
-            is_correct = normalize_text(user_answer) == correct_answer
+            is_correct = normalize_text(user_answer) == normalize_text(correct_answer)
         else:
-            user_answer = prompt_short_answer()
-            correct_answer = normalize_text(question["answer"])
-            is_correct = normalize_text(user_answer) == correct_answer
+            is_correct = normalize_text(user_answer) == normalize_text(correct_answer)
 
         if is_correct:
             points = 0.75 if used_hint else 1.0
             score += points
             print(f"Correct. +{points:.2f} points")
         else:
-            print(f"Incorrect. Correct answer: {question['answer']}")
+            print(f"Incorrect. Correct answer: {correct_answer}")
 
         prompt_feedback(user_id, int(question["id"]))
         print()
@@ -611,13 +832,26 @@ def setup() -> None:
 def main() -> None:
     try:
         setup()
-        user_id, username = login_flow()
-
-        total_available = len(get_all_questions_with_feedback(user_id))
+        total_available = get_total_question_count()
         if total_available == 0:
             raise QuizError("No questions available in quiz database.")
 
+        user_id, username = login_flow()
+
         while True:
+            action = prompt_logged_in_action()
+            if action == "2":
+                show_user_history(username)
+                prompt_return_to_interface()
+                continue
+            if action == "3":
+                show_liked_questions(user_id)
+                prompt_return_to_interface()
+                continue
+            if action == "4":
+                print("Goodbye.")
+                break
+
             count = parse_question_count(total_available)
             generate_quiz_json(user_id, count)
             questions = load_generated_quiz_with_refetch(user_id, count)
@@ -625,12 +859,11 @@ def main() -> None:
                 continue
 
             run_quiz(user_id, username, questions)
-            if not prompt_yes_no("Would you like to take another quiz? (yes/no): "):
-                print("Goodbye.")
-                break
 
     except QuizError as exc:
         print(str(exc))
+    except (sqlite3.Error, OSError) as exc:
+        print(f"A system error occurred: {exc}")
     except KeyboardInterrupt:
         print("\nApplication interrupted.")
 
